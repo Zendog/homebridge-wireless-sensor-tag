@@ -1,0 +1,14 @@
+{
+  "platforms": [
+    {
+      "platform": "wireless-sensor-tag",
+      "name": "Wireless Sensor Tags",
+      "token": "YOUR_API_TOKEN_HERE",
+      "queryFrequency": 60,
+      "tagManagers": {
+        "TagManager1": "MAC_ADDRESS_1",
+        "TagManager2": "MAC_ADDRESS_2"
+      }
+    }
+  ]
+}
