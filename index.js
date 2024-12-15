@@ -1,167 +1,146 @@
 const axios = require("axios");
-const xmldoc = require("xmldoc");
 
-let Service, Characteristic, Accessory;
+let Service, Characteristic;
 
-// Handle registration with Homebridge
-module.exports = function (homebridge) {
+module.exports = (homebridge) => {
     Service = homebridge.hap.Service;
     Characteristic = homebridge.hap.Characteristic;
-    Accessory = homebridge.hap.Accessory;
 
     homebridge.registerPlatform(
         "homebridge-wireless-sensor-tag",
         "wireless-sensor-tag",
-        WirelessTagPlatform
+        WirelessTagPlatform,
+        true // Enable dynamic platform
     );
 };
 
-// Platform object for the wireless tags. Represents the wireless tag manager
-function WirelessTagPlatform(log, config) {
-    this.log = log;
-    this.token = config.token;
-    this.queryFrequency = config.queryFrequency || 60; // default query frequency is 60 seconds
-    this.tagManagers = config.tagManagers || {};
-    this.deviceLookup = {};
+class WirelessTagPlatform {
+    constructor(log, config, api) {
+        this.log = log;
+        this.config = config || {};
+        this.api = api;
 
-    if (!this.token) {
-        throw new Error(
-            "No token specified in configuration for Wireless Sensor Tags."
-        );
+        this.token = this.config.token;
+        this.queryFrequency = this.config.queryFrequency || 60000;
+        this.tagManagers = this.config.tagManagers || {};
+        this.accessories = new Map();
+
+        if (!this.token) {
+            throw new Error(
+                "No token specified in configuration for Wireless Sensor Tags."
+            );
+        }
+
+        this.log(`Plugin configuration: ${JSON.stringify(this.config, null, 2)}`);
+
+        if (this.queryFrequency < 5000) {
+            this.log("Invalid query frequency; setting to 20000ms default.");
+            this.queryFrequency = 20000;
+        }
+
+        if (this.api) {
+            this.api.on("didFinishLaunching", this.onReady.bind(this));
+        }
     }
 
-    this.log(`Plugin configuration: ${JSON.stringify(config, null, 2)}`);
-}
+    onReady() {
+        this.log("Homebridge has finished launching.");
+        this.startPolling();
+    }
 
-WirelessTagPlatform.prototype = {
-    // Reload data from the wireless tags API
-    reloadData: function (callback) {
+    startPolling() {
+        this.log(`Setting up periodic updates every ${this.queryFrequency} ms.`);
+        this.reloadData();
+        setInterval(this.reloadData.bind(this), this.queryFrequency);
+    }
+
+    async reloadData() {
         this.log("Starting reloadData...");
-        const foundAccessories = [];
-        const that = this;
+        for (const [managerName, macAddress] of Object.entries(this.tagManagers)) {
+            try {
+                const devices = await this.getTagList(macAddress);
+                this.log(`Fetched tag list for manager: ${macAddress}`);
 
-        const tagManagerRequests = Object.entries(this.tagManagers).map(
-            ([name, macAddress]) => {
-                return this.getTagList(macAddress)
-                    .then((devices) => {
-                        if (devices && Array.isArray(devices)) {
-                            devices.forEach((device) => {
-                                this.log(
-                                    `Processing device ${device.name} (${device.uuid}) from ${name}`
-                                );
-                                let accessory;
-                                if (that.deviceLookup[device.uuid]) {
-                                    accessory = that.deviceLookup[device.uuid];
-                                    accessory.device = device;
-                                    accessory.loadData(device);
-                                } else {
-                                    accessory = new WirelessTagAccessory(
-                                        that,
-                                        device,
-                                        name
-                                    );
-                                    if (accessory) {
-                                        that.log(
-                                            `Device added from ${name} - ${device.uuid}`
-                                        );
-                                        that.deviceLookup[device.uuid] =
-                                            accessory;
-                                        foundAccessories.push(accessory);
-                                    }
-                                }
-                            });
-                        } else {
-                            this.log(`No devices found for ${name}`);
-                        }
-                    })
-                    .catch((error) => {
-                        this.log(
-                            `Error fetching devices for ${name}: ${error.message}`
-                        );
-                    });
+                devices.forEach((device) => this.processDevice(device, managerName));
+            } catch (error) {
+                this.log(
+                    `Error fetching devices for manager "${managerName}" (MAC: ${macAddress}): ${error.message}`
+                );
             }
-        );
+        }
+    }
 
-        Promise.all(tagManagerRequests).then(() => {
-            this.log("Completed reloadData");
-            if (callback) {
-                callback(foundAccessories);
-            }
-        });
-    },
-
-    // Fetch the tag list for a specific tag manager
-    getTagList: function (macAddress) {
-        const url = "https://www.mytaglist.com/ethClient.asmx/GetTagList";
+    async getTagList(macAddress) {
+        const url = "https://mytaglist.com/ethClient.asmx/GetTagList2";
         const headers = {
-            Authorization: `Bearer ${this.token}`,
             "Content-Type": "application/json",
-            "X-Set-Mac": macAddress,
+            Authorization: `Bearer ${this.token}`,
         };
 
-        return axios
-            .post(url, {}, { headers })
-            .then((response) => {
-                this.log(
-                    `API response for MAC ${macAddress}: ${JSON.stringify(
-                        response.data,
-                        null,
-                        2
-                    )}`
-                );
-                return response.data.d; // Return the device list
-            })
-            .catch((error) => {
-                this.log(
-                    `Error fetching tag list for MAC ${macAddress}: ${error.message}`
-                );
-                throw error;
+        try {
+            const response = await axios.post(url, {}, { headers });
+            return response.data?.d.filter((device) => device.mac === macAddress) || [];
+        } catch (error) {
+            this.log(
+                `Error fetching tag list for MAC ${macAddress}: ${error.message}`
+            );
+            throw error;
+        }
+    }
+
+    processDevice(device, managerName) {
+        const uuid = this.api.hap.uuid.generate(device.uuid);
+
+        if (this.accessories.has(uuid)) {
+            // Update existing accessory
+            const existingAccessory = this.accessories.get(uuid);
+            this.log(`Updating existing accessory: ${device.name} (${uuid})`);
+            existingAccessory.context.device = device;
+            existingAccessory.updateReachability(true);
+            this.updateAccessoryData(existingAccessory, device);
+        } else {
+            // Register a new accessory
+            this.log(`Adding new accessory: ${device.name} (${uuid})`);
+            const accessory = new this.api.platformAccessory(device.name, uuid);
+            accessory.context.device = device;
+
+            this.addAccessoryServices(accessory, device);
+
+            this.accessories.set(uuid, accessory);
+            this.api.registerPlatformAccessories(
+                "homebridge-wireless-sensor-tag",
+                "wireless-sensor-tag",
+                [accessory]
+            );
+        }
+    }
+
+    addAccessoryServices(accessory, device) {
+        const tempService =
+            accessory.getService(Service.TemperatureSensor) ||
+            accessory.addService(Service.TemperatureSensor);
+
+        tempService
+            .getCharacteristic(Characteristic.CurrentTemperature)
+            .on("get", (callback) => {
+                callback(null, device.temperature || 0);
             });
-    },
 
-    // Called by Homebridge to load accessories
-    accessories: function (callback) {
-        this.reloadData(callback);
-    },
-};
+        this.log(`Added temperature service for ${device.name}.`);
+    }
 
-// Accessory class for Wireless Tags
-function WirelessTagAccessory(platform, device, tagManagerName) {
-    this.platform = platform;
-    this.device = device;
-    this.tagManagerName = tagManagerName;
-    this.name = device.name;
-
-    // Create the information service
-    this.informationService = new Service.AccessoryInformation()
-        .setCharacteristic(Characteristic.Manufacturer, "Wireless Sensor Tags")
-        .setCharacteristic(Characteristic.Model, device.tagType || "Unknown Model")
-        .setCharacteristic(Characteristic.SerialNumber, device.uuid);
-
-    // Create the temperature service
-    this.temperatureService = new Service.TemperatureSensor(this.name);
-    this.temperatureService
-        .getCharacteristic(Characteristic.CurrentTemperature)
-        .on("get", (callback) => {
-            if (device.temperature !== undefined) {
-                callback(null, device.temperature);
-            } else {
-                callback(new Error("Temperature not available"));
-            }
-        });
-}
-
-WirelessTagAccessory.prototype = {
-    loadData: function (device) {
-        this.device = device;
-        if (this.temperatureService) {
-            this.temperatureService
+    updateAccessoryData(accessory, device) {
+        const tempService = accessory.getService(Service.TemperatureSensor);
+        if (tempService) {
+            tempService
                 .getCharacteristic(Characteristic.CurrentTemperature)
                 .updateValue(device.temperature || 0);
+            this.log(`Updated temperature for ${device.name}: ${device.temperature}`);
         }
-    },
+    }
 
-    getServices: function () {
-        return [this.informationService, this.temperatureService];
-    },
-};
+    configureAccessory(accessory) {
+        this.log(`Loading cached accessory: ${accessory.displayName}`);
+        this.accessories.set(accessory.UUID, accessory);
+    }
+}
